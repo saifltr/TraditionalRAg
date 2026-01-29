@@ -1,0 +1,21 @@
+{
+  "evaluation_framework": "DeepEval",
+  "metrics_used": [
+    "Comprehensiveness",
+    "Depth of Explanation",
+    "Coherence",
+    "Synthesis Quality",
+    "Pedagogical Value",
+    "AnswerRelevancyMetric"
+  ],
+  "simple_rag": {
+    "aggregates": {},
+    "num_questions": 19
+  },
+  "advanced_rag": {
+    "aggregates": {},
+    "num_questions": 19
+  },
+  "winner": "simple_rag",
+  "margin": 0
+}
