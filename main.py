@@ -227,7 +227,7 @@ async def chat_stream(
         """Generate SSE stream."""
         try:
             # Small delay before streaming starts
-            await asyncio.sleep(3)
+            await asyncio.sleep(2)
             
             if model == ModelType.MISTRAL:
                 # Mistral streaming
