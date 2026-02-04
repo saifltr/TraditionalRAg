@@ -3,6 +3,7 @@ FastAPI Backend for RAG Application
 """
 
 import os
+import json
 import tempfile
 import logging
 import asyncio
@@ -21,6 +22,13 @@ try:
     MISTRAL_AVAILABLE = True
 except ImportError:
     MISTRAL_AVAILABLE = False
+
+# httpx for Vexoo SRA streaming
+try:
+    import httpx
+    HTTPX_AVAILABLE = True
+except ImportError:
+    HTTPX_AVAILABLE = False
 
 from vector_store import VectorStore
 from llm_inference import LLMInference
@@ -44,6 +52,7 @@ class ModelType(str, Enum):
     CLAUDE_SONNET = "claude-sonnet"
     CLAUDE_OPUS = "claude-opus"
     MISTRAL = "mistral"
+    VEXOO_SRA = "vexoo-sra"
 
 # Initialize vector store with top_k=3
 vector_store = VectorStore(
@@ -113,6 +122,21 @@ def get_mistral_client():
         )
     
     return mistral_client
+
+
+def get_vexoo_sra_config() -> dict:
+    """Get Vexoo SRA configuration from environment."""
+    base_url = os.getenv("VEXOO_SRA_BASE_URL", "http://20.106.211.17:8001")
+    base_url = base_url.rstrip("/")
+    
+    return {
+        "base_url": base_url,
+        "max_tokens": int(os.getenv("VEXOO_SRA_MAX_TOKENS", "16384")),
+        "temperature": float(os.getenv("VEXOO_SRA_TEMPERATURE", "0.7")),
+        "top_p": float(os.getenv("VEXOO_SRA_TOP_P", "0.9")),
+        "repetition_penalty": float(os.getenv("VEXOO_SRA_REPETITION_PENALTY", "1.1")),
+        "timeout": float(os.getenv("VEXOO_SRA_TIMEOUT", "180")),
+    }
 
 
 @app.get("/")
@@ -189,7 +213,7 @@ async def chat_stream(
     model: ModelType = Query(...),
     use_history: bool = Query(True)
 ):
-    """Chat endpoint with streaming (8 second delay before starting)."""
+    """Chat endpoint with streaming."""
     stats = vector_store.get_stats()
     if stats["total_documents"] == 0:
         raise HTTPException(status_code=400, detail="No documents uploaded")
@@ -200,10 +224,10 @@ async def chat_stream(
         raise HTTPException(status_code=404, detail="No relevant context found")
     
     async def generate_stream():
-        """Generate SSE stream with 8 second delay."""
+        """Generate SSE stream."""
         try:
-            # Add 8 second delay before streaming
-            await asyncio.sleep(8)
+            # Small delay before streaming starts
+            await asyncio.sleep(3)
             
             if model == ModelType.MISTRAL:
                 # Mistral streaming
@@ -232,13 +256,107 @@ async def chat_stream(
                         except:
                             continue
             
+            elif model == ModelType.VEXOO_SRA:
+                # Vexoo SRA streaming via /v1/chat SSE endpoint
+                if not HTTPX_AVAILABLE:
+                    yield "Error: httpx package not installed. Run: pip install httpx"
+                    return
+                
+                config = get_vexoo_sra_config()
+                
+                system_prompt = "Answer the question using the context provided. Keep answers brief and direct."
+                user_message = f"Context:\n{context}\n\nQuestion: {query}"
+                
+                messages = [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_message}
+                ]
+                
+                payload = {
+                    "messages": messages,
+                    "max_tokens": config["max_tokens"],
+                    "temperature": config["temperature"],
+                    "top_p": config["top_p"],
+                    "repetition_penalty": config["repetition_penalty"],
+                    "stream": True
+                }
+                
+                logger.info(f"[VexooSRA-RAG] Streaming request to {config['base_url']}/v1/chat")
+                
+                async with httpx.AsyncClient(
+                    timeout=httpx.Timeout(config["timeout"], connect=30.0)
+                ) as client:
+                    async with client.stream(
+                        "POST",
+                        f"{config['base_url']}/v1/chat",
+                        json=payload,
+                        headers={
+                            "Content-Type": "application/json",
+                            "Accept": "application/json"
+                        }
+                    ) as response:
+                        if response.status_code != 200:
+                            error_body = await response.aread()
+                            error_msg = f"Vexoo SRA returned status {response.status_code}: {error_body.decode()[:500]}"
+                            logger.error(error_msg)
+                            yield f"Error: {error_msg}"
+                            return
+                        
+                        # Parse SSE stream: data: {"token": "word "}
+                        buffer = ""
+                        async for chunk in response.aiter_text():
+                            buffer += chunk
+                            
+                            while "\n" in buffer:
+                                line, buffer = buffer.split("\n", 1)
+                                line = line.strip()
+                                
+                                if not line:
+                                    continue
+                                
+                                if line.startswith("data: "):
+                                    data_str = line[6:].strip()
+                                    if not data_str:
+                                        continue
+                                    
+                                    try:
+                                        data = json.loads(data_str)
+                                        
+                                        if "token" in data:
+                                            yield data["token"]
+                                        elif "done" in data and data["done"]:
+                                            return
+                                        elif "error" in data:
+                                            logger.error(f"Vexoo SRA stream error: {data['error']}")
+                                            yield f"\n\nError from model: {data['error']}"
+                                            return
+                                    except json.JSONDecodeError:
+                                        continue
+                        
+                        # Process remaining buffer
+                        if buffer.strip():
+                            line = buffer.strip()
+                            if line.startswith("data: "):
+                                try:
+                                    data = json.loads(line[6:].strip())
+                                    if "token" in data:
+                                        yield data["token"]
+                                except json.JSONDecodeError:
+                                    pass
+            
             else:
-                # Claude streaming
+                # Claude streaming (Sonnet / Opus)
                 llm = get_llm_instance(model)
                 
                 for chunk in llm.generate_response_stream(query, context, sources, use_history):
                     yield chunk
             
+        except httpx.ConnectError as e:
+            logger.error(f"Could not connect to Vexoo SRA: {e}")
+            yield f"Error: Could not connect to Vexoo SRA server. Is it running?"
+        except httpx.TimeoutException as e:
+            logger.error(f"Vexoo SRA request timed out: {e}")
+            yield f"Error: Request to Vexoo SRA timed out."
         except Exception as e:
             logger.error(f"Error in streaming: {e}")
             yield f"Error: {str(e)}"
@@ -263,7 +381,7 @@ async def get_vector_store_stats():
 async def get_token_usage(model: ModelType):
     """Get token usage for model."""
     try:
-        if model == ModelType.MISTRAL:
+        if model in (ModelType.MISTRAL, ModelType.VEXOO_SRA):
             return {
                 "total_input_tokens": 0,
                 "total_output_tokens": 0,
@@ -297,7 +415,7 @@ async def clear_vector_store():
 async def clear_chat_history(model: ModelType):
     """Clear chat history."""
     try:
-        if model != ModelType.MISTRAL:
+        if model not in (ModelType.MISTRAL, ModelType.VEXOO_SRA):
             llm = get_llm_instance(model)
             llm.clear_history()
         return {"success": True, "message": f"Chat history cleared for {model.value}"}
@@ -308,11 +426,22 @@ async def clear_chat_history(model: ModelType):
 @app.get("/health")
 async def health_check():
     """Health check."""
-    return {
+    health = {
         "status": "healthy",
         "vector_store_documents": vector_store.get_stats()["total_documents"],
         "vector_store_chunks": vector_store.get_stats()["total_chunks"]
     }
+    
+    # Optionally check Vexoo SRA connectivity
+    try:
+        config = get_vexoo_sra_config()
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(f"{config['base_url']}/health")
+            health["vexoo_sra_status"] = "reachable" if resp.status_code == 200 else "error"
+    except Exception:
+        health["vexoo_sra_status"] = "unreachable"
+    
+    return health
 
 
 if __name__ == "__main__":
