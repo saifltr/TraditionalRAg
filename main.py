@@ -50,7 +50,7 @@ app.add_middleware(
 
 class ModelType(str, Enum):
     CLAUDE_SONNET = "claude-sonnet"
-    CLAUDE_OPUS = "claude-opus"
+    CLAUDE_HAIKU = "claude-haiku"
     MISTRAL = "mistral"
     VEXOO_SRA = "vexoo-sra"
 
@@ -83,16 +83,16 @@ def get_llm_instance(model: ModelType):
                     history_file=f"qa_history_sonnet.json"
                 )
                 
-            elif model == ModelType.CLAUDE_OPUS:
+            elif model == ModelType.CLAUDE_HAIKU:
                 api_key = os.getenv("ANTHROPIC_API_KEY")
                 if not api_key:
                     raise ValueError("ANTHROPIC_API_KEY not found")
                 
                 llm_instances[model_key] = LLMInference(
                     api_key=api_key,
-                    model="claude-opus-4-5-20251101",
+                    model="claude-3-5-haiku-20241022",
                     max_tokens=500,
-                    history_file=f"qa_history_opus.json"
+                    history_file=f"qa_history_haiku.json"
                 )
             
         except Exception as e:
@@ -345,7 +345,7 @@ async def chat_stream(
                                     pass
             
             else:
-                # Claude streaming (Sonnet / Opus)
+                # Claude streaming (Sonnet / Haiku)
                 llm = get_llm_instance(model)
                 
                 for chunk in llm.generate_response_stream(query, context, sources, use_history):
