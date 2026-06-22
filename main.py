@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import List, Optional
 from enum import Enum
 
-from fastapi import FastAPI, File, UploadFile, HTTPException, Query, Form
+from fastapi import FastAPI, File, UploadFile, HTTPException, Query, Form, Request
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
@@ -47,6 +47,55 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def _strip_empty_file_parts(body: bytes, boundary: bytes) -> bytes:
+    """Remove blank ``files`` parts from a multipart body.
+
+    Clients such as curl's ``-F 'files='`` (or a frontend that always appends a
+    ``files`` field) send a part named ``files`` with no ``filename`` and no
+    content. FastAPI rejects that against ``List[UploadFile]`` before the route
+    runs. Dropping these empty parts lets a Google-only upload through while the
+    endpoint keeps a clean ``UploadFile`` signature (and Swagger's upload box).
+    """
+    delimiter = b"--" + boundary
+    segments = body.split(delimiter)
+    if len(segments) < 3:  # not a well-formed multipart body; leave untouched
+        return body
+
+    kept = [segments[0]]
+    for part in segments[1:-1]:
+        header_blob = part.split(b"\r\n\r\n", 1)[0]
+        is_files = b'name="files"' in header_blob
+        has_filename = b"filename=" in header_blob and b'filename=""' not in header_blob
+        if is_files and not has_filename:
+            continue  # blank files part -> drop it
+        kept.append(part)
+    kept.append(segments[-1])
+    return delimiter.join(kept)
+
+
+@app.middleware("http")
+async def drop_empty_file_uploads(request: Request, call_next):
+    """Sanitize empty ``files`` parts on the upload endpoint before validation."""
+    content_type = request.headers.get("content-type", "")
+    if (
+        request.url.path == "/upload-documents"
+        and request.method == "POST"
+        and "multipart/form-data" in content_type
+        and "boundary=" in content_type
+    ):
+        boundary = content_type.split("boundary=", 1)[1].strip().strip('"').encode()
+        body = await request.body()
+        new_body = _strip_empty_file_parts(body, boundary)
+        if new_body != body:
+            # Re-inject the rewritten body for the downstream route to read.
+            async def receive():
+                return {"type": "http.request", "body": new_body, "more_body": False}
+
+            request._receive = receive
+
+    return await call_next(request)
 
 SUPPORTED_EXTENSIONS = [
     ".pdf", ".docx", ".doc", ".txt", ".md", ".csv", ".xlsx", ".xls", ".pptx", ".ppt"
@@ -144,6 +193,11 @@ async def upload_documents(
     (a Google Drive folder/file URL, a direct/zip URL, or several
     comma/newline-separated). At least one source is required.
     """
+    # Drop blank entries (e.g. curl's ``-F 'files='``); keep only real uploads.
+    files = [f for f in (files or []) if getattr(f, "filename", None)]
+    if session_id is not None and not session_id.strip():
+        session_id = None
+
     has_files = bool(files)
     has_google = bool(google_knowledge_base and google_knowledge_base.strip())
     if not has_files and not has_google:
