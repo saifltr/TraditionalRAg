@@ -388,3 +388,64 @@ class VectorStore:
         self.chunks = []
         self.documents = {}
         logger.info("Vector store cleared")
+
+    # =========================================================================
+    # DISK PERSISTENCE (per-session)
+    # The FAISS index goes to faiss.index (binary); chunks + document metadata
+    # go to store.json. Together they fully reconstruct the in-memory state so a
+    # session can be rehydrated after a server restart.
+    # =========================================================================
+
+    INDEX_FILENAME = "faiss.index"
+    STORE_FILENAME = "store.json"
+
+    def save(self, directory: str) -> None:
+        """Persist the FAISS index + chunks/documents to ``directory``."""
+        dir_path = Path(directory)
+        dir_path.mkdir(parents=True, exist_ok=True)
+
+        faiss.write_index(self.index, str(dir_path / self.INDEX_FILENAME))
+
+        with open(dir_path / self.STORE_FILENAME, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "chunk_size": self.chunk_size,
+                    "chunk_overlap": self.chunk_overlap,
+                    "top_k": self.top_k,
+                    "chunks": self.chunks,
+                    "documents": self.documents,
+                },
+                f,
+                ensure_ascii=False,
+            )
+        logger.info(f"Vector store saved to {dir_path}")
+
+    def load(self, directory: str) -> bool:
+        """Rebuild in-memory state from ``directory``. Returns True on success."""
+        dir_path = Path(directory)
+        index_path = dir_path / self.INDEX_FILENAME
+        store_path = dir_path / self.STORE_FILENAME
+
+        if not index_path.exists() or not store_path.exists():
+            return False
+
+        try:
+            self.index = faiss.read_index(str(index_path))
+
+            with open(store_path, "r", encoding="utf-8") as f:
+                state = json.load(f)
+
+            self.chunk_size = state.get("chunk_size", self.chunk_size)
+            self.chunk_overlap = state.get("chunk_overlap", self.chunk_overlap)
+            self.top_k = state.get("top_k", self.top_k)
+            self.chunks = state.get("chunks", [])
+            self.documents = state.get("documents", {})
+
+            logger.info(
+                f"Vector store loaded from {dir_path} "
+                f"({len(self.documents)} docs, {len(self.chunks)} chunks)"
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Failed to load vector store from {dir_path}: {e}")
+            return False

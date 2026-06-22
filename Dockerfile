@@ -18,9 +18,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY main.py .
 COPY vector_store.py .
 COPY llm_inference.py .
+COPY session_manager.py .
+COPY google_ingest.py .
 COPY .env .
-# Create directory for data persistence
-RUN mkdir -p /app/data
+# Create directory for session data persistence (mounted as a volume)
+RUN mkdir -p /app/data/sessions
 
 # Expose port
 EXPOSE 8003
